@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# YOLO / 训练
+runs/
+*.cache
+*.pt
+*.pth
+*.onnx
+*.engine
+*.plan
+weights/
+datasets/
+crack_dataset/
+calib_images/
+
+# 第三方库
+third_party/
+*.tar
+*.tar.gz
+
+# 环境变量
+.env
+.env.*
+
+# IDE
+.vscode/*
+!.vscode/c_cpp_properties.json
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+
+# 系统
+.DS_Store
+Thumbs.db
+*.log
+
+# 构建产物
+deploy/cpp/build/
