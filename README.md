@@ -1,341 +1,211 @@
-# 工业缺陷检测的 TensorRT 边缘推理加速
+# 🚀 工业缺陷检测的 TensorRT 边缘推理加速
 
-基于 **YOLOv8 + ONNX + TensorRT** 的工业缺陷实时检测与边缘推理优化。以**混凝土裂缝（crack）**为典型缺陷样本，完整打通从模型训练、ONNX 导出、TensorRT FP16/INT8 量化，到 C++ 高性能推理的全链路部署。
+![Python](https://img.shields.io/badge/Python-3.10-blue)
+![TensorRT](https://img.shields.io/badge/TensorRT-10.7-green)
+![CUDA](https://img.shields.io/badge/CUDA-12.6-orange)
+![C++](https://img.shields.io/badge/C++--17-red)
 
-在 RTX 3050 Laptop（4GB 显存）这类典型边缘算力上，纯推理延迟从 PyTorch 的 **14.6 ms** 压缩到 TensorRT FP16 的 **3.72 ms**，C++ 端到端（预处理 + 推理 + 后处理）**4.84 ms / 207 FPS**，达到工业在线检测的实时性要求。
+基于 **YOLOv8 + ONNX + TensorRT** 的工业缺陷实时检测与边缘推理优化。以**混凝土裂缝（Crack）**为典型缺陷样本，完整打通从模型训练、ONNX 导出、TensorRT FP16/INT8 量化，到 C++ 高性能推理的全链路部署。
 
----
-
-## 目录
-
-- [项目亮点](#项目亮点)
-- [性能基准](#性能基准)
-- [模型精度](#模型精度)
-- [技术架构](#技术架构)
-- [项目结构](#项目结构)
-- [快速开始](#快速开始)
-- [使用流程详解](#使用流程详解)
-- [关键技术点](#关键技术点)
-- [踩坑记录](#踩坑记录)
-- [未来工作](#未来工作)
-- [环境详情](#环境详情)
-- [参考](#参考)
+在 RTX 3050 Laptop（4GB 显存）这类典型边缘算力上，C++ 端到端（预处理 + 推理 + 后处理）耗时压至 **4.45 ms**，实测峰值突破 **224.5 FPS**，充分满足了工业在线检测的严苛实时性要求。
 
 ---
 
-## 项目亮点
+## 📖 目录
 
-- **完整部署链路**：PyTorch → ONNX → TensorRT FP16/INT8 → C++ 推理，每一环都有可复现脚本与实测数据
-- **推理加速约 3 倍**：PyTorch 14.6 ms → TensorRT FP16 3.72 ms（P50）
-- **C++ 端到端 4.84 ms，FPS 207**：含预处理与后处理，非纯推理数字
-- **INT8 量化**：模型体积减少 20%，权重内存减少 45%，并在量化受阻时给出明确归因
-- **手写 NMS + DFL 解码**：不依赖 Ultralytics 后处理，C++ 侧零 Python 依赖
-- **动态 shape 支持**：320×320 ~ 640×640 单引擎覆盖多分辨率
-
----
-
-## 性能基准
-
-| 阶段 | 延迟 | FPS | 模型大小 | 说明 |
-|---|---|---|---|---|
-| PyTorch (Python) | 14.6 ms | 68 | 6.2 MB | 纯推理 |
-| ONNX Runtime (Python) | ~10 ms | ~100 | 12.5 MB | 未单独精细测量 |
-| TensorRT FP16 (Python) | **3.72 ms** (P50) | 269 | 9.7 MB | 纯推理 |
-| TensorRT INT8 (Python) | **3.53 ms** (P50) | 221 | 7.8 MB | 纯推理 |
-| **TensorRT FP16 (C++ 端到端)** | **4.84 ms** | **207** | — | 预处理 + 推理 + 后处理 |
-
-> **测试环境**：WSL2 Ubuntu + CUDA 12.6 + TensorRT 10.7 + RTX 3050 Laptop (4GB)
-> 分辨率 416×416，warmup 10 次 + 100 次循环取 P50。
-
-**结论**：相对 PyTorch 基线，FP16 引擎纯推理提速约 **3.9×**；C++ 端到端仍保持在 5 ms 以内，说明预处理与手写后处理不再是瓶颈，管线整体处于计算受限的最优区间。
+- [项目亮点](#-项目亮点)
+- [性能与精度基准](#-性能与精度基准)
+- [技术架构与数据流](#️️-技术架构与数据流)
+- [项目结构](#-项目结构)
+- [快速开始](#-快速开始)
+- [硬核技术点解析](#-硬核技术点解析)
+- [踩坑记录 (Debug Log)](#️-踩坑记录-debug-log)
+- [未来工作](#-未来工作)
 
 ---
 
-## 模型精度
+## 🌟 项目亮点
 
-| 指标 | 值 |
-|---|---|
-| mAP50 | 0.847 |
-| mAP50-95 | 0.825 |
-| Precision | 0.661 |
-| Recall | 0.942 |
-
-模型为 **YOLOv8n**（nano），单类别缺陷检测。Recall 高达 0.942 是刻意取舍的结果——工业缺陷检测场景中漏检代价远高于误检，因此容忍一定误报换取高召回。
+- **全链路部署闭环**：PyTorch → ONNX → TensorRT FP16/INT8 → C++ 推理，每一环都有可复现脚本与实测数据。
+- **极限端到端性能**：C++ 端到端（预处理+推理+手写后处理）仅需 **4.45 ms，峰值 224 FPS**。
+- **INT8 量化深度探索**：模型体积减少 20%，权重内存减少 45%，并精准归因了动态算子回退 FP16 的底层原因。
+- **手写 NMS + DFL 解码**：完全剥离 Ultralytics 后处理，C++ 侧实现零 Python、零 PyTorch 依赖。
+- **动态 Shape 支持**：单引擎覆盖 320×320 ~ 640×640 多分辨率输入，适配多场景相机。
 
 ---
 
-## 技术架构
+## 📊 性能与精度基准
 
-```
+### 性能压测（RTX 3050 Laptop, 416×416, warmup=10, runs=100）
+
+| 阶段 | 延迟 (ms) | FPS | 模型大小 | 说明 |
+| :--- | :--- | :--- | :--- | :--- |
+| **PyTorch (Python)** | 14.6 ms | 68 | 6.2 MB | 纯推理（Baseline） |
+| **ONNX Runtime (Python)** | ~10 ms | ~100 | 12.5 MB | 未单独精细测量 |
+| **TensorRT FP16 (Python)** | 3.72 ms | 269 | 9.7 MB | 纯推理 |
+| **TensorRT INT8 (Python)** | 3.53 ms | 221 | 7.8 MB | 纯推理 |
+| **🔥 TensorRT FP16 (C++ 端到端)** | **4.45 ms** | **224** | - | **预处理 + 推理 + 手写后处理** |
+
+> **结论**：FP16 引擎纯推理相比 PyTorch 提速约 **3.9×**；C++ 端到端耗时控制在 5ms 以内，说明预处理与手写后处理不再是瓶颈，整条管线处于计算受限的最优区间。
+
+### 模型精度（YOLOv8n, 单类别）
+
+| 指标 | 数值 | 说明 |
+| :--- | :--- | :--- |
+| **mAP50** | 0.847 | - |
+| **mAP50-95** | 0.825 | - |
+| **Precision** | 0.661 | - |
+| **Recall** | **0.942** | **业务取舍：工业漏检代价远高于误检，刻意容忍误报换取高召回**。 |
+
+---
+
+## 🏗️ 技术架构与数据流
+
+```text
 ┌─────────────┐    ┌─────────┐    ┌──────────────┐    ┌──────────────┐
 │  PyTorch    │───▶│  ONNX   │───▶│  TensorRT    │───▶│  C++ +       │
 │  YOLOv8n    │    │ 12.5 MB │    │  FP16 / INT8 │    │  OpenCV      │
 └─────────────┘    └─────────┘    └──────────────┘    └──────────────┘
-    14.6 ms          ~10 ms           3.72 ms           4.84 ms
-                                                        207 FPS
+    14.6 ms          ~10 ms           3.72 ms           4.45 ms (224 FPS)
 ```
 
-**数据流**：图像 → `letterbox` 缩放到 416×416 → 归一化 / HWC→CHW → GPU 拷贝 → TensorRT `enqueueV3` → 输出 `[1, 5, 3549]` → DFL 解码 + 框还原 → NMS → 绘制结果。
+**C++ 端数据流转**：
+
+图像输入 → letterbox 缩放至 416×416 → 归一化 / HWC→CHW → GPU memcpy → TensorRT enqueueV3 异步推理 → 输出 [1, 5, 3549] → 手写 DFL 解码 + 框还原 → 手写 NMS → OpenCV 绘制结果。
 
 ---
 
-## 项目结构
+## 📂 项目结构
 
-```
+> **注**：为了保证仓库轻量化，项目已配置严格的 `.gitignore`。大型文件（如数据集、预训练权重、第三方 SDK、编译产物等）不会提交到 Git。克隆本项目后，需参照下方说明自行准备。
+
+```text
 yolo-demo/
-├── crack_dataset/                 # 数据集（train 826 / valid 100 / test 50）
-├── calib_images/                  # INT8 校准集（200 张）
-├── scripts/                       # Python 工具脚本
-│   ├── check_dataset.py           # 数据集校验
-│   └── train.py                   # YOLOv8n 训练
-├── weights/
-│   ├── pretrained/                # 官方预训练权重
-│   ├── trained/                   # 自己训练的模型（best.pt）
-│   └── engines/                   # ONNX + FP16 + INT8 engine
-├── deploy/
-│   ├── trt_python/                # TensorRT Python 脚本
-│   │   ├── onnx_to_engine.py      # FP16 engine 构建
-│   │   ├── onnx_to_int8_engine.py # INT8 engine 构建
-│   │   ├── int8_calibrator.py     # INT8 校准器
-│   │   ├── trt_infer.py           # 推理性能测试
-│   │   └── compare_fp16_int8.py   # FP16 vs INT8 对比
-│   ├── cpp/                       # C++ TensorRT 推理
-│   │   ├── CMakeLists.txt
-│   │   ├── include/trt_engine.h
-│   │   └── src/
-│   │       ├── trt_engine.cpp     # 引擎封装：预处理 + 推理 + NMS
-│   │       └── main.cpp           # 主程序
-│   ├── engine/                    # 部署用 engine 副本
-│   └── docs/                      # 性能报告 + 结果图
-│       ├── benchmark_cpp.md
-│       └── cpp_result.jpg
-├── runs/detect/train/             # 训练曲线、混淆矩阵
-├── third_party/                   # TensorRT C++ SDK
-├── ENVIRONMENT.md                 # 环境配置文档
-└── README.md
+├── .vscode/                           # VS Code 配置 (部分保留)
+│   ├── c_cpp_properties.json          # [Tracked] 提供 C++ 头文件路径与环境感知
+│   └── extensions.json                # [Tracked] 推荐插件列表
+├── calib_images/                      # [Git Ignored] INT8 量化校准集 (200 张)
+├── crack_dataset/                     # [Git Ignored] 混凝土裂缝数据集 (YOLO 格式)
+├── deploy/                            # 🚀 核心部署代码区 (主要维护区域)
+│   ├── cpp/                           # C++ TensorRT 高性能推理工程
+│   │   ├── build/                     # [Git Ignored] CMake 构建中间产物
+│   │   ├── include/                   # C++ 头文件目录
+│   │   │   └── trt_engine.h           # [Tracked] TensorRT 引擎封装类声明
+│   │   ├── src/                       # C++ 源码目录
+│   │   │   ├── main.cpp               # [Tracked] 主程序入口 (命令行参数解析)
+│   │   │   └── trt_engine.cpp         # [Tracked] 核心实现 (预处理/推理/NMS/DFL)
+│   │   └── CMakeLists.txt             # [Tracked] C++ 工程构建脚本
+│   ├── trt_python/                    # Python 端量化与验证脚本
+│   │   ├── int8_calibrator.py         # [Tracked] INT8 熵校准器实现
+│   │   ├── onnx_to_engine.py          # [Tracked] ONNX 转 FP16 Engine 脚本
+│   │   ├── onnx_to_int8_engine.py     # [Tracked] ONNX 转 INT8 Engine 脚本
+│   │   └── trt_infer.py               # [Tracked] Python 端推理与性能基准测试
+│   ├── docs/                          # 性能报告与文档说明
+│   └── engine/                        # [Git Ignored] 存放部署用的 .engine 副本
+├── runs/                              # [Git Ignored] YOLOv8 训练日志与权重
+├── scripts/                           # Python 辅助脚本
+│   ├── check_dataset.py               # [Tracked] 数据集完整性校验脚本
+│   └── train.py                       # [Tracked] YOLOv8n 训练启动脚本
+├── third_party/                       # [Git Ignored] TensorRT C++ SDK 本地依赖库
+├── venv/                              # [Git Ignored] Python 虚拟环境
+├── weights/                           # [Git Ignored] 模型权重目录
+│   ├── pretrained/                    # 官方预训练权重 (.pt)
+│   ├── trained/                       # 训练产出的 best.pt
+│   └── engines/                       # 导出的 ONNX 与 TRT Engine (.engine)
+├── .gitignore                         # Git 忽略规则
+├── ENVIRONMENT.md                     # [Tracked] 双系统开发环境基准档案
+├── LICENSE                            # [Tracked] 开源协议 (MIT)
+└── README.md                          # [Tracked] 项目说明文档
 ```
 
 ---
 
-## 快速开始
+## 🚀 快速开始
 
-### 环境要求
+### 1. 环境要求
 
 | 组件 | 版本 |
-|---|---|
-| 系统 | WSL2 Ubuntu 22.04 或原生 Ubuntu |
-| CUDA | 12.6 |
-| TensorRT | 10.7 |
-| Python | 3.10 |
-| PyTorch | 2.5.1+cu121 |
-| OpenCV | 4.10 |
+| :--- | :--- |
+| 系统 | WSL2 Ubuntu 26.04（原生 Linux 也可） |
+| CUDA / TensorRT | CUDA 12.6 / TensorRT 10.7 |
+| Python | 3.10（强烈建议，3.14 太新暂无 PyTorch Wheel） |
+| C++ | GCC 15.2 / CMake 4.2 |
 
-> Python 版本请严格使用 3.10。3.14 过新，PyTorch 生态尚无对应 wheel，会直接导致安装失败（详见[踩坑记录](#踩坑记录)）。
+> 注：完整双系统环境配置请参阅 `ENVIRONMENT.md`
 
-### 创建虚拟环境
+### 2. 安装与训练
 
 ```bash
-cd ~/workspace/yolo_trt/yolo-demo
+# 创建虚拟环境
 python3.10 -m venv venv
 source venv/bin/activate
+
+# 安装核心依赖
 pip install torch==2.5.1+cu121 torchvision --index-url https://download.pytorch.org/whl/cu121
 pip install ultralytics onnx onnxsim onnxruntime-gpu opencv-python
 pip install tensorrt==10.7 --no-build-isolation
-```
 
-TensorRT Python 包必须加 `--no-build-isolation`，否则 pip 构建隔离环境下找不到 `setuptools` 会安装失败。
-
-### 训练
-
-```bash
-source venv/bin/activate
-
-# 校验数据集
-python scripts/check_dataset.py --root crack_dataset
-
-# 训练 YOLOv8n
+# 训练与导出 (需提前准备好数据集)
 python scripts/train.py
-```
-
-### 导出 ONNX
-
-```bash
 yolo export model=weights/trained/best.pt format=onnx opset=12 simplify=True dynamic=True
 ```
 
-`dynamic=True` 是后续动态 shape 的前提，`simplify=True` 会清理 ONNX 图中的冗余算子，降低 TensorRT 解析失败的概率。
-
-### 构建 TensorRT Engine
-
-**FP16：**
-
-```bash
-cd deploy/trt_python
-python onnx_to_engine.py \
-  --onnx ../../weights/engines/best.onnx \
-  --engine ../../weights/engines/best_fp16.engine \
-  --precision fp16
-```
-
-**INT8：**
-
-```bash
-python onnx_to_int8_engine.py \
-  --onnx ../../weights/engines/best.onnx \
-  --engine ../../weights/engines/best_int8.engine \
-  --calib ../../calib_images \
-  --cache ../../calib.cache
-```
-
-> Engine 与 GPU 架构、TensorRT 版本强绑定，**不可跨机器复用**。换机器请重新构建。校准缓存 `calib.cache` 可复用，能省掉约 71.7 秒的校准耗时。
-
-### Python 推理测试
-
-```bash
-python trt_infer.py \
-  --engine ../../weights/engines/best_fp16.engine \
-  --image ../../crack_dataset/test/images/00031_jpg.rf.540253f521fc24e940187f74b98ec587.jpg \
-  --size 416 \
-  --warmup 10 \
-  --runs 100
-```
-
-**FP16 / INT8 对比：**
-
-```bash
-python compare_fp16_int8.py \
-  --fp16 ../../weights/engines/best_fp16.engine \
-  --int8 ../../weights/engines/best_int8.engine \
-  --image-dir ../../crack_dataset/test/images
-```
-
-### C++ 推理
+### 3. C++ 编译与极限测试
 
 ```bash
 cd deploy/cpp
 mkdir -p build && cd build
 cmake ..
-make -j4
+make -j$(nproc)
 
-./yolo_trt_demo \
-  ../../../weights/engines/best_fp16.engine \
-  ../../../crack_dataset/test/images/00031_jpg.rf.540253f521fc24e940187f74b98ec587.jpg \
-  output.jpg
+# 执行端到端推理测试 (416x416)
+./yolo_trt_demo ../../weights/engines/best_fp16.engine ../../crack_dataset/test/images/xxx.jpg output.jpg
 ```
 
-C++ 侧只依赖 TensorRT + OpenCV + CUDA Runtime，不需要 Python 与 PyTorch，可直接部署到生产环境或 Jetson 设备。
+---
+
+## 🧠 硬核技术点解析
+
+### 1. 动态 Shape 支持
+
+ONNX 导出时使用 `dynamic=True`，TensorRT 构建时配置 optimization profile（`min=320, opt=416, max=640`），实现单引擎覆盖所有分辨率。且 `opt` 设为 416，让内核自动调优针对该常用尺寸极致优化。
+
+### 2. INT8 量化的"玄学"与真相
+
+使用 **Entropy Calibration v2** 耗时 71.7 秒完成校准。
+
+**关键发现**：YOLOv8 输出头的动态 shape 算子（Range、Shape、Cast）不支持 INT8，TensorRT 会自动将其回退到 FP16。这导致小模型（YOLOv8n）在 INT8 下延迟收益有限（3.72 → 3.53 ms），但模型体积减少 20%，权重内存减少 45%。**INT8 的价值在显存受限的边缘设备上巨大，若要压榨极限性能，需改写静态 Shape 或手写 TRT Plugin。**
+
+### 3. C++ 核心推理与手写后处理
+
+- **顺序铁律**：必须先 `context->setInputShape()` 再 `context->getTensorShape()`，否则输出元素数会返回 -5（无效维度）。
+- **异步推演**：使用 TensorRT 10.x 推荐的 `enqueueV3`，配合 CUDA stream 消除隐式同步开销。
+- **手写 DFL 解码**：YOLOv8 是 anchor-free 输出，回归分支为 4×reg_max 分布，C++ 侧完全手写 DFL 积分还原坐标与 NMS，彻底摆脱对 Python 运行时的依赖。
 
 ---
 
-## 关键技术点
+## 🕳️ 踩坑记录 (Debug Log)
 
-### 1. 动态 shape 支持
-
-ONNX 导出时使用 `dynamic=True`，TensorRT 构建时配置 optimization profile：
-
-```python
-profile.set_shape(
-    input_name,
-    min=(1, 3, 320, 320),
-    opt=(1, 3, 416, 416),
-    max=(1, 3, 640, 640),
-)
-```
-
-实际收益是一个 engine 覆盖 320~640 全部分辨率，无需为每种输入尺寸单独构建引擎。代价是 `max` 设置过大会让 TensorRT 在优化时偏向保守，因此把日常使用的 416 设为 `opt`，让内核自动调优针对该尺寸优化。
-
-### 2. INT8 校准
-
-使用 **Entropy Calibration v2**，200 张校准图，耗时 71.7 秒。
-
-关键发现：YOLOv8 输出头的动态 shape 算子（`Range`、`Shape`、`Cast`）不支持 INT8，TensorRT 会自动把这些层**回退到 FP16**。这导致在 YOLOv8n 这类小模型上，INT8 的延迟收益有限（3.72 → 3.53 ms，约 5%），但仍有明确的工程价值：
-
-- 模型体积减少 **20%**（9.7 MB → 7.8 MB）
-- 权重内存减少 **45%**
-
-也就是说 INT8 的价值主要体现在**显存与存储受限的边缘设备**，而非算力受限场景。若想进一步压榨 INT8 性能，需要把输出头的动态算子改写为静态 shape 或自定义 TensorRT plugin。
-
-### 3. C++ 推理核心
-
-```cpp
-// 动态 shape：先设 shape 再拿输出维度
-context_->setInputShape("images", nvinfer1::Dims4{1, 3, 416, 416});
-auto out_dims = context_->getTensorShape("output0");  // [1, 5, 3549]
-
-// 推理
-context_->setTensorAddress("images", gpu_input_);
-context_->setTensorAddress("output0", gpu_output_);
-context_->enqueueV3(stream_);
-
-// 后处理：NMS + DFL 解码
-auto detections = postprocess(output_data, img_w, img_h, 0.25f, 0.45f);
-```
-
-三个要点：
-
-1. **顺序不能颠倒**：必须先 `setInputShape` 再 `getTensorShape`，否则输出元素数返回 `-5`（无效维度）。
-2. **使用 `enqueueV3`**：TensorRT 10.x 的推荐异步接口，配合 CUDA stream 使用，避免隐式同步开销。
-3. **手写 DFL 解码**：YOLOv8 是 anchor-free 输出，回归分支是 4×reg_max 的分布，需做 DFL（Distribution Focal Loss）积分还原成坐标，不依赖 Ultralytics 的 Python 后处理。
-
-输出 `[1, 5, 3549]` 中，`5 = 4（框）+ 1（类别）`（单类别），`3549` 是 416 分辨率下三个检测头的锚点总数（52² + 26² + 13² = 2704 + 676 + 169）。
+| 问题现象 | 根因分析 | 解决方案 |
+| :--- | :--- | :--- |
+| PyTorch 装不上 | Python 3.14 太新，官方生态无对应 wheel | 降级并使用 Python 3.10 虚拟环境 |
+| C 盘被撑爆 | WSL2 的 vhdx 虚拟磁盘只增不减 | 将 WSL2 整个迁移到 D 盘，并设置 TMPDIR |
+| 找不到 libcudnn.so.9 | ONNX Runtime GPU 依赖 cuDNN 9 | `pip install nvidia-cudnn-cu12` 并配置 LD_LIBRARY_PATH |
+| TensorRT 安装失败 | pip 构建隔离环境下找不到 setuptools | 必须加上 `--no-build-isolation` 参数 |
+| getTensorShape 返回 -5 | 动态 shape 下未先 setInputShape | 严格保证调用顺序：先 set 再 get |
+| C++ 编译找不到 NvInfer.h | pip 安装的包不包含 C++ 开发头文件 | 从官方下载完整 tar.gz，将 include 和 lib 软链接到 /usr/local/ |
+| 可执行栈限制 | glibc 2.41+ 安全机制加强 | `patchelf --clear-execstack <lib_path>` |
 
 ---
 
-## 踩坑记录
+## 🔮 未来工作
 
-| 问题 | 原因 | 解决 |
-|---|---|---|
-| PyTorch 装不上 | Python 3.14 太新，无对应 wheel | 换成 Python 3.10 |
-| C 盘被撑爆 | WSL2 的 vhdx 虚拟磁盘只增不减 | 迁移到 D 盘 + 设置 `TMPDIR` |
-| `libcudnn.so.9` 找不到 | ONNX Runtime GPU 版本需要 cuDNN 9 | `pip install nvidia-cudnn-cu12` + 配置 `LD_LIBRARY_PATH` |
-| TensorRT 安装失败 | pip 构建隔离环境下找不到 `setuptools` | 加 `--no-build-isolation` |
-| `cannot enable executable stack` | glibc 2.41+ 加强了安全限制 | `patchelf --clear-execstack <lib>` |
-| `no optimization profile` | 动态 shape 未配置 profile | 添加 `min/opt/max` profile |
-| 输出元素数为 `-5` | `getTensorShape` 前未 `setInputShape` | 先调 `setInputShape` |
-
-完整排障记录见 [ENVIRONMENT.md](ENVIRONMENT.md)。
+- [ ] **C++ 预处理 CUDA 化**：将逐像素的 CPU 预处理迁移到 CUDA Kernel，实现全链路零内存拷贝。
+- [ ] **多线程流水线**：多 Engine 并行，提升工业产线的高并发吞吐量。
+- [ ] **Nsight Systems 调优**：深度定位剩余的 CPU/GPU 异步瓶颈。
+- [ ] **Triton Inference Server 部署**：接入云端或边缘节点统一调度。
+- [ ] **Jetson Orin 实测**：在真实工业边缘硬件上进行功耗与算力压测。
 
 ---
 
-## 未来工作
-
-- [ ] C++ 预处理优化（逐像素 → 连续内存访问 / CUDA kernel 化）
-- [ ] 多线程流水线（多 engine 并行，提升吞吐）
-- [ ] Nsight Systems 性能分析，定位剩余瓶颈
-- [ ] Triton Inference Server 部署
-- [ ] TensorRT plugin 自定义算子（解决 INT8 回退问题）
-- [ ] Jetson 边缘设备实测
-
----
-
-## 环境详情
-
-| 项目 | 配置 |
-|---|---|
-| CPU | AMD Ryzen 5 5600H（6 核 12 线程） |
-| GPU | NVIDIA RTX 3050 Laptop（4GB） |
-| 内存 | 7.7 GB（WSL 分配） |
-| 系统 | Windows 11 + WSL2 Ubuntu |
-| 驱动 | 595.79 |
-
----
-
-## 参考
-
-- [Ultralytics YOLOv8](https://docs.ultralytics.com/models/yolov8/)
-- [NVIDIA TensorRT Developer Guide](https://docs.nvidia.com/deeplearning/tensorrt/developer-guide/)
-- [ONNX Runtime](https://onnxruntime.ai/docs/)
-
----
-
-## 数据集
-
-混凝土裂缝检测数据集，YOLO 格式标注，共 976 张：
-
-| 划分 | 数量 |
-|---|---|
-| train | 826 |
-| valid | 100 |
-| test | 50 |
-
-INT8 校准集从训练集中抽取 200 张，与训练/验证集解耦，避免校准偏差。
+**Author**: w-leee | **Dataset**: 混凝土裂缝检测数据集 (YOLO格式, 共976张) | **License**: MIT
